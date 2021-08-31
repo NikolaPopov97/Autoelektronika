@@ -52,13 +52,11 @@ Mkfile.old
 dkms.conf
 
 *.tlog
-Projekat/Projekat/.vs/FreeRTOS_simulator_final/v16/.suo
-Projekat/Projekat/.vs/FreeRTOS_simulator_final/v16/.suo
+*.suo
 *.db
 *.db-shm
 *.db
 *.db-wal
-Projekat/Projekat/.vs/FreeRTOS_simulator_final/v16/Browse.VC.db
 *.opendb
 *.ipch
 Projekat/Projekat/.vs/FreeRTOS_simulator_final/v16/.suo
