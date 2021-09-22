@@ -98,13 +98,14 @@ static void TimerCallback(TimerHandle_t xTimer)
 void SM_Task(void* pvParameters) 
 {
 	sensor_val SensTemp;
-	xQueueReceive(SensorQueue, &SensTemp , portMAX_DELAY);
-	printf("u sm: %u\n", (unsigned)SensTemp.air_temp);/*for debug*/
-	printf("u sm: %u\n", (unsigned)SensTemp.coolant_temp);/*for debug*/
-	printf("u sm: %u\n", (unsigned)SensTemp.revs);/*for debug*/
-	printf("u sm: %u\n", (unsigned)SensTemp.manifold_air_press);/*for debug*/
-	printf("u sm: %u\n", (unsigned)SensTemp.gas_pedal_pos);/*for debug*/
-
+	while (1) {
+		xQueueReceive(SensorQueue, &SensTemp, portMAX_DELAY);
+		printf("u sm: %u\n", (unsigned)SensTemp.air_temp);/*for debug*/
+		printf("u sm: %u\n", (unsigned)SensTemp.coolant_temp);/*for debug*/
+		printf("u sm: %u\n", (unsigned)SensTemp.revs);/*for debug*/
+		printf("u sm: %u\n", (unsigned)SensTemp.manifold_air_press);/*for debug*/
+		printf("u sm: %u\n", (unsigned)SensTemp.gas_pedal_pos);/*for debug*/
+	}
 }
 
 
@@ -210,17 +211,17 @@ void SerialReceive_Task(void* pvParameters)
 		get_serial_character(COM_CH, &cc);
 		printf("primio karakter: %u\n", (unsigned)cc);/*for debug*/
 		
-		if (cc == 0x00) /*initialise recieve buffer*/
-		{		
+		if ((0x00 == cc)&&(R_BUF_SIZE == r_point)) /*initialise recieve buffer*/
+		{/*second check is if some sensor values are 0x00, so that we don't reinitialise the buffer */
 			r_point = 0;
 			
 		}
-		else if (cc == 0xff)/*end character case*/
-		{
+		else if ((cc == 0xff)&&(R_BUF_SIZE == r_point))/*end character case*/
+		{/*second check is if some sensor values are 0xff, so that we don't finish earlier*/
 			/*load SensTemp with r_buffer*/
 			SensTemp.air_temp = r_buffer[0];
 			SensTemp.coolant_temp = r_buffer[1];
-			SensTemp.revs = ((uint16_t)(r_buffer[2]<<8u))|(uint16_t)r_buffer[3];
+			SensTemp.revs = ((uint16_t)r_buffer[2]<<8u)|(uint16_t)r_buffer[3];
 			SensTemp.manifold_air_press = r_buffer[4];
 			SensTemp.gas_pedal_pos = r_buffer[5];
 			xQueueSend(SensorQueue, &SensTemp, 0U);/*pass r_buffer to queue*/
