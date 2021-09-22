@@ -1,8 +1,0 @@
-H:\spaseni podatci\Za faks\Autoelektronika\Projekat\Projekat\Starter\Debug\Starter.exe
-H:\spaseni podatci\Za faks\Autoelektronika\Projekat\Projekat\Starter\Debug\Starter.pdb
-H:\spaseni podatci\Za faks\Autoelektronika\Projekat\Projekat_radi_sve_osim_ispisa\Starter\Debug\Starter.exe
-H:\spaseni podatci\Za faks\Autoelektronika\Projekat\Projekat_radi_sve_osim_ispisa\Starter\Debug\Starter.pdb
-H:\spaseni podatci\Za faks\Autoelektronika\Projekat\Projekat_radi_sve\Starter\Debug\Starter.exe
-H:\spaseni podatci\Za faks\Autoelektronika\Projekat\Projekat_radi_sve\Starter\Debug\Starter.pdb
-D:\Storage\faks\8semestar\autoelektronika\projekat\Projekat_radi_sve\Starter\Debug\Starter.exe
-C:\Users\user\Autoelektronika\Projekat_radi_sve\Starter\Debug\Starter.exe
