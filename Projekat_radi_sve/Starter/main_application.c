@@ -14,19 +14,27 @@
 
 /* SERIAL SIMULATOR CHANNEL TO USE */
 #define COM_CH (0)
+#define COM_CH_1 (1)
 
 	/* TASK PRIORITIES */
 #define SM_TASK_PRI					( tskIDLE_PRIORITY + 1 )
 #define	SERVICE_TASK_PRI			( tskIDLE_PRIORITY + 2 )
-#define	TASK_SERIAL_SEND_PRI		( tskIDLE_PRIORITY + 3 )
-#define TASK_SERIAl_REC_PRI			( tskIDLE_PRIORITY + 4 )
+#define TASK_SDH_PRI				( tskIDLE_PRIORITY + 3 )
+#define	TASK_SERIAL_SEND_PRI		( tskIDLE_PRIORITY + 4 )
+#define TASK_PC_SERIAL_REC			( tskIDLE_PRIORITY + 5 )
+#define TASK_SERIAl_REC_PRI			( tskIDLE_PRIORITY + 6 )
 
 
 /* TASKS: FORWARD DECLARATIONS */
 void led_bar_tsk( void *pvParameters );
 void SerialSend_Task(void* pvParameters);
 void SerialReceive_Task(void* pvParameters);
+void PC_SerialReceive_Task(void* pvParameters);
+void SensorDataHandler(void* pvParameters);
 void SM_Task(void* pvParameters);
+
+/*Local function declarations*/
+void takeAllStateSem(void);
 
 /* TRASNMISSION DATA - CONSTANT IN THIS APPLICATION */
 const char trigger[] = "XYZ";
@@ -41,6 +49,12 @@ unsigned volatile r_point;
 static const char hexnum[] = { 0x3F, 0x06, 0x5B, 0x4F, 0x66, 0x6D, 0x7D, 0x07, 
 								0x7F, 0x6F, 0x77, 0x7C, 0x39, 0x5E, 0x79, 0x71 };
 
+/*STATES*/
+#define MONITOR 'm'
+#define DRIVE   'd'
+#define SPEED   's'
+#define OFF     'o'
+
 /*DATA STRUCTS*/
 typedef struct sensor_val{/*struct for holding sensor values*/
 	uint8_t air_temp;
@@ -50,13 +64,38 @@ typedef struct sensor_val{/*struct for holding sensor values*/
 	uint8_t gas_pedal_pos;
 }sensor_val;
 
+typedef struct monitor_val {
+	uint8_t air_temp;
+	uint8_t coolant_temp;
+}monitor_val;
+
+typedef struct drive_val {
+	uint16_t revs;
+	uint8_t manifold_air_press;
+}drive_val;
+
+typedef struct speed_val {
+	uint16_t revs;
+	uint8_t gas_pedal_pos;
+}speed_val;
+
 
 /* GLOBAL OS-HANDLES */
 SemaphoreHandle_t LED_INT_BinarySemaphore;
 SemaphoreHandle_t TBE_BinarySemaphore;
 SemaphoreHandle_t RXC_BinarySemaphore;
+SemaphoreHandle_t RXC_PCSemaphore;
+SemaphoreHandle_t MonitorStateSem;
+SemaphoreHandle_t DriveStateSem;
+SemaphoreHandle_t SpeedStateSem;
+SemaphoreHandle_t OffStateSem;
+SemaphoreHandle_t AlarmStateSem;
 TimerHandle_t per_TimerHandle;
-QueueHandle_t SensorQueue = NULL;
+QueueHandle_t SensorQueue;
+QueueHandle_t MessageQueue;
+QueueHandle_t MonitorQueue;
+QueueHandle_t DriveQueue;
+QueueHandle_t SpeedQueue;
 
 /* OPC - ON INPUT CHANGE - INTERRUPT HANDLER */
 static uint32_t OnLED_ChangeInterrupt(void)
@@ -83,7 +122,11 @@ static uint32_t prvProcessRXCInterrupt(void)
 {
 	BaseType_t xHigherPTW = pdFALSE;
 
-	xSemaphoreGiveFromISR(RXC_BinarySemaphore, &xHigherPTW);
+	if (get_RXC_status(0) != 0)
+		xSemaphoreGiveFromISR(RXC_BinarySemaphore, &xHigherPTW);
+
+	if (get_RXC_status(1) != 0)
+		xSemaphoreGiveFromISR(RXC_PCSemaphore, &xHigherPTW);
 
 	portYIELD_FROM_ISR(xHigherPTW);
 }
@@ -92,20 +135,6 @@ static uint32_t prvProcessRXCInterrupt(void)
 static void TimerCallback(TimerHandle_t xTimer)
 { 
 	xSemaphoreGive(TBE_BinarySemaphore);
-}
-
-/*STATE MACHINE FOR SYSTEM*/
-void SM_Task(void* pvParameters) 
-{
-	sensor_val SensTemp;
-	while (1) {
-		xQueueReceive(SensorQueue, &SensTemp, portMAX_DELAY);
-		printf("u sm: %u\n", (unsigned)SensTemp.air_temp);/*for debug*/
-		printf("u sm: %u\n", (unsigned)SensTemp.coolant_temp);/*for debug*/
-		printf("u sm: %u\n", (unsigned)SensTemp.revs);/*for debug*/
-		printf("u sm: %u\n", (unsigned)SensTemp.manifold_air_press);/*for debug*/
-		printf("u sm: %u\n", (unsigned)SensTemp.gas_pedal_pos);/*for debug*/
-	}
 }
 
 
@@ -117,11 +146,22 @@ void main_demo( void )
 	init_serial_uplink(COM_CH);  // inicijalizacija serijske TX na kanalu 0
 	init_serial_downlink(COM_CH);// inicijalizacija serijske TX na kanalu 0
 
-	/* QUEUE  */
-	SensorQueue = xQueueCreate(5u, sizeof(sensor_val));
+	init_serial_uplink(COM_CH_1);
+	init_serial_downlink(COM_CH_1);
+
+	/* QUEUES  */
+	SensorQueue = xQueueCreate(1u, sizeof(sensor_val));
+	MessageQueue = xQueueCreate(5u, sizeof(uint8_t));
+	MonitorQueue = xQueueCreate(1u, sizeof(monitor_val));
+	DriveQueue = xQueueCreate(1u, sizeof(drive_val));
+	SpeedQueue = xQueueCreate(1u, sizeof(speed_val));
+	
 
 	/*STATE MACHINE TASK*/
 	xTaskCreate(SM_Task, "SM", configMINIMAL_STACK_SIZE, NULL, SM_TASK_PRI, NULL);
+
+	/*Create sensor data handler task*/
+	xTaskCreate(SensorDataHandler, "Sdh", configMINIMAL_STACK_SIZE, NULL, TASK_SDH_PRI, NULL);
 
 	/* ON INPUT CHANGE INTERRUPT HANDLER */
 	vPortSetInterruptHandler(portINTERRUPT_SRL_OIC, OnLED_ChangeInterrupt);
@@ -134,19 +174,28 @@ void main_demo( void )
 	xTimerStart(per_TimerHandle, 0);
 
 	
-
 	/* SERIAL TRANSMITTER TASK */
 	xTaskCreate(SerialSend_Task, "STx", configMINIMAL_STACK_SIZE, NULL, TASK_SERIAL_SEND_PRI, NULL);
 
-	/* SERIAL RECEIVER TASK */
+	/* SERIAL RECEIVER TASKS */
 	xTaskCreate(SerialReceive_Task, "SRx", configMINIMAL_STACK_SIZE, NULL, TASK_SERIAl_REC_PRI, NULL);
 	r_point = 0;
+	xTaskCreate(PC_SerialReceive_Task, "PCRx", configMINIMAL_STACK_SIZE, NULL, TASK_PC_SERIAL_REC, NULL);
+
 
 	/* Create TBE semaphore - serial transmit comm */
 	TBE_BinarySemaphore = xSemaphoreCreateBinary();
 
-	/* Create TBE semaphore - serial transmit comm */
+	/* Create TBE semaphore - serial receive comm */
 	RXC_BinarySemaphore = xSemaphoreCreateBinary();
+	RXC_PCSemaphore = xSemaphoreCreateBinary();
+
+	/*Create State Semaphores*/
+	MonitorStateSem = xSemaphoreCreateBinary();
+	DriveStateSem = xSemaphoreCreateBinary();
+	SpeedStateSem = xSemaphoreCreateBinary();
+	OffStateSem = xSemaphoreCreateBinary();
+	AlarmStateSem = xSemaphoreCreateBinary(); 
 
 	/* SERIAL TRANSMISSION INTERRUPT HANDLER */
 	vPortSetInterruptHandler(portINTERRUPT_SRL_TBE, prvProcessTBEInterrupt);
@@ -161,6 +210,75 @@ void main_demo( void )
 
 	while (1);
 }
+
+
+
+/*STATE MACHINE FOR THE SYSTEM*/
+/*This task determens the next state based on Msg input, and unblocks state tasks*/
+void SM_Task(void* pvParameters)
+{
+	uint8_t Msg;
+	while (1) {
+		xQueueReceive(MessageQueue, &Msg, portMAX_DELAY);/*Task is blocked until a new message arrives*/
+		takeAllStateSem();/*wait until a state task finishes and then block them so another state can be enabled*/
+		switch (Msg) 
+		{
+		case MONITOR:
+			xSemaphoreGive(MonitorStateSem, portMAX_DELAY);/*enable state task*/
+		case DRIVE:
+			xSemaphoreGive(DriveStateSem, portMAX_DELAY);/*enable state task*/
+		case SPEED:
+			xSemaphoreGive(SpeedStateSem, portMAX_DELAY);/*enable state task*/
+		case OFF:
+			xSemaphoreGive(OffStateSem, portMAX_DELAY);/*Turn off system*/
+		default:/*turn on alarm unexpected message is sent*/
+			xSemaphoreGive(AlarmStateSem, portMAX_DELAY);
+		}
+	}
+}
+
+/*This task checks if sensor values are within normal operating range,*/
+/*then sends sensor data to their state queues*/
+void SensorDataHandler(void* pvParameters)
+{
+	/*Buffers for queues*/
+	sensor_val SensTemp;
+	monitor_val MonitorTemp;
+	drive_val DriveTemp;
+	speed_val SpeedTemp;
+	while (1)
+	{	
+		xQueueReceive(SensorQueue,&SensTemp,portMAX_DELAY);/*recieve new sensor data*/
+		if(110u < SensTemp.coolant_temp)
+		{/*check if engine is overheating*/
+			xSemaphoreGive(AlarmStateSem, portMAX_DELAY);
+		}
+		else if (6000 < SensTemp.gas_pedal_pos)
+		{/*check if engine revs are too high*/
+			xSemaphoreGive(AlarmStateSem, portMAX_DELAY);
+		}
+		else
+		{/*if sensor data is within range only then disable alarm*/
+			xSemaphoreTake(AlarmStateSem, portMAX_DELAY);
+		}
+
+		/*Send monitor data to monitor queue*/
+		MonitorTemp.air_temp = SensTemp.air_temp;
+		MonitorTemp.coolant_temp = SensTemp.coolant_temp;
+		xQueueOverwrite(MonitorQueue, &MonitorTemp);
+		/*Send drive data to drive queue*/
+		DriveTemp.revs = SensTemp.revs;
+		DriveTemp.manifold_air_press = SensTemp.manifold_air_press;
+		xQueueOverwrite(DriveQueue, &DriveTemp);
+		/*Send speed data to drive queue*/
+		SpeedTemp.revs = SensTemp.revs;
+		SpeedTemp.gas_pedal_pos = SensTemp.gas_pedal_pos;
+		xQueueOverwrite(SpeedQueue, &SpeedTemp);
+
+	}
+}
+
+
 
 void led_bar_tsk(void* pvParameters)
 {
@@ -181,6 +299,27 @@ void led_bar_tsk(void* pvParameters)
 	}
 }
 
+/*Task for receiving pc commands and sending them to another task to handle them*/
+void PC_SerialReceive_Task(void* pvParameters) 
+{
+	uint8_t cc;
+	uint8_t temp;
+	while (1)
+	{
+		xSemaphoreTake(RXC_PCSemaphore, portMAX_DELAY);/*suspend task until a character is received*/
+		get_serial_character(COM_CH, &cc);
+		if (0x0d == cc)
+		{
+			xQueueSend(MessageQueue, &temp, portMAX_DELAY);
+		}
+		else
+		{
+			temp = cc;
+		}
+	}
+}
+
+/*Task is used for polling sensor serial line*/
 void SerialSend_Task(void* pvParameters)
 {
 	t_point = 0;
@@ -200,6 +339,8 @@ void SerialSend_Task(void* pvParameters)
 	}
 }
 
+
+/*Task handles receiving sensor data and then puts it in a queue*/
 void SerialReceive_Task(void* pvParameters)
 {
 	uint8_t cc = 0;
@@ -207,7 +348,7 @@ void SerialReceive_Task(void* pvParameters)
 	sensor_val SensTemp;
 	while (1)
 	{
-		xSemaphoreTake(RXC_BinarySemaphore, portMAX_DELAY);/*suspend task until a character is recieved*/
+		xSemaphoreTake(RXC_BinarySemaphore, portMAX_DELAY);/*suspend task until a character is received*/
 		get_serial_character(COM_CH, &cc);
 		printf("primio karakter: %u\n", (unsigned)cc);/*for debug*/
 		
@@ -235,4 +376,12 @@ void SerialReceive_Task(void* pvParameters)
 			/*alarm task or smtng*/
 		}
 	}
+}
+
+/*Function used to take all semaphores*/
+void takeAllStateSem(void) {
+	xSemaphoreTake(MonitorStateSem, portMAX_DELAY);
+	xSemaphoreTake(DriveStateSem, portMAX_DELAY);
+	xSemaphoreTake(SpeedStateSem, portMAX_DELAY);
+	xSemaphoreTake(OffStateSem, portMAX_DELAY);
 }
