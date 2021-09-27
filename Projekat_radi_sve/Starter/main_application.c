@@ -17,12 +17,13 @@
 #define COM_CH_1 (1)
 
 	/* TASK PRIORITIES */
-#define SM_TASK_PRI					( tskIDLE_PRIORITY + 1 )
 #define	SERVICE_TASK_PRI			( tskIDLE_PRIORITY + 2 )
+#define TASK_ALARM_PRI				( tskIDLE_PRIORITY + 1 )
 #define TASK_SDH_PRI				( tskIDLE_PRIORITY + 3 )
-#define	TASK_SERIAL_SEND_PRI		( tskIDLE_PRIORITY + 4 )
-#define TASK_PC_SERIAL_REC			( tskIDLE_PRIORITY + 5 )
-#define TASK_SERIAl_REC_PRI			( tskIDLE_PRIORITY + 6 )
+#define TASK_SEG7_Task				( tskIDLE_PRIORITY + 4 )
+#define	TASK_SERIAL_SEND_PRI		( tskIDLE_PRIORITY + 5 )
+#define TASK_PC_SERIAL_REC			( tskIDLE_PRIORITY + 6 )
+#define TASK_SERIAl_REC_PRI			( tskIDLE_PRIORITY + 7 )
 
 
 /* TASKS: FORWARD DECLARATIONS */
@@ -31,10 +32,9 @@ void SerialSend_Task(void* pvParameters);
 void SerialReceive_Task(void* pvParameters);
 void PC_SerialReceive_Task(void* pvParameters);
 void SensorDataHandler(void* pvParameters);
-void SM_Task(void* pvParameters);
+void Seg7Task(void* pvParameters);
+void AlarmTask(void* pvParameters);
 
-/*Local function declarations*/
-void takeAllStateSem(void);
 
 /* TRASNMISSION DATA - CONSTANT IN THIS APPLICATION */
 const char trigger[] = "XYZ";
@@ -49,11 +49,28 @@ unsigned volatile r_point;
 static const char hexnum[] = { 0x3F, 0x06, 0x5B, 0x4F, 0x66, 0x6D, 0x7D, 0x07, 
 								0x7F, 0x6F, 0x77, 0x7C, 0x39, 0x5E, 0x79, 0x71 };
 
-/*STATES*/
+/*MESSAGES*/
+/*state messages*/
 #define MONITOR 'm'
 #define DRIVE   'd'
 #define SPEED   's'
 #define OFF     'o'
+
+/*led messages*/
+#define ALARM_ON 0xff
+#define LED_ON   0x01
+#define LED_OFF  0x00
+
+/*BUTTON MASKS*/
+#define BTN1 0x80
+#define BTN2 0x40
+#define BTN3 0x20
+#define NO_BTN 0x00
+
+/*CRITICAL VALUES*/
+#define MAX_COOLANT_TEMP  110u
+#define MAX_REVS		 6000u
+
 
 /*DATA STRUCTS*/
 typedef struct sensor_val{/*struct for holding sensor values*/
@@ -64,38 +81,23 @@ typedef struct sensor_val{/*struct for holding sensor values*/
 	uint8_t gas_pedal_pos;
 }sensor_val;
 
-typedef struct monitor_val {
-	uint8_t air_temp;
-	uint8_t coolant_temp;
-}monitor_val;
-
-typedef struct drive_val {
-	uint16_t revs;
-	uint8_t manifold_air_press;
-}drive_val;
-
-typedef struct speed_val {
-	uint16_t revs;
-	uint8_t gas_pedal_pos;
-}speed_val;
-
 
 /* GLOBAL OS-HANDLES */
 SemaphoreHandle_t LED_INT_BinarySemaphore;
 SemaphoreHandle_t TBE_BinarySemaphore;
 SemaphoreHandle_t RXC_BinarySemaphore;
 SemaphoreHandle_t RXC_PCSemaphore;
-SemaphoreHandle_t MonitorStateSem;
-SemaphoreHandle_t DriveStateSem;
-SemaphoreHandle_t SpeedStateSem;
-SemaphoreHandle_t OffStateSem;
 SemaphoreHandle_t AlarmStateSem;
 TimerHandle_t per_TimerHandle;
 QueueHandle_t SensorQueue;
 QueueHandle_t MessageQueue;
-QueueHandle_t MonitorQueue;
-QueueHandle_t DriveQueue;
-QueueHandle_t SpeedQueue;
+QueueHandle_t Seg7Queue;
+QueueHandle_t LedQueue;
+
+
+/*Local function declarations*/
+/*Function used to format sensor data and current mode code*/
+void FormAndSend7SegData(sensor_val SensTemp, uint8_t Msg);
 
 /* OPC - ON INPUT CHANGE - INTERRUPT HANDLER */
 static uint32_t OnLED_ChangeInterrupt(void)
@@ -134,7 +136,8 @@ static uint32_t prvProcessRXCInterrupt(void)
 /* PERIODIC TIMER CALLBACK */
 static void TimerCallback(TimerHandle_t xTimer)
 { 
-	xSemaphoreGive(TBE_BinarySemaphore);
+	xSemaphoreGive(TBE_BinarySemaphore); 
+	xSemaphoreGive(AlarmStateSem);
 }
 
 
@@ -152,27 +155,28 @@ void main_demo( void )
 	/* QUEUES  */
 	SensorQueue = xQueueCreate(1u, sizeof(sensor_val));
 	MessageQueue = xQueueCreate(5u, sizeof(uint8_t));
-	MonitorQueue = xQueueCreate(1u, sizeof(monitor_val));
-	DriveQueue = xQueueCreate(1u, sizeof(drive_val));
-	SpeedQueue = xQueueCreate(1u, sizeof(speed_val));
-	
+	Seg7Queue = xQueueCreate(10u, sizeof(uint8_t));
+	LedQueue = xQueueCreate(1u, sizeof(uint8_t));
 
-	/*STATE MACHINE TASK*/
-	xTaskCreate(SM_Task, "SM", configMINIMAL_STACK_SIZE, NULL, SM_TASK_PRI, NULL);
-
-	/*Create sensor data handler task*/
-	xTaskCreate(SensorDataHandler, "Sdh", configMINIMAL_STACK_SIZE, NULL, TASK_SDH_PRI, NULL);
 
 	/* ON INPUT CHANGE INTERRUPT HANDLER */
 	vPortSetInterruptHandler(portINTERRUPT_SRL_OIC, OnLED_ChangeInterrupt);
 
-	/* Create LED interrapt semaphore */
+	/* Create LED interrupt semaphore */
 	LED_INT_BinarySemaphore = xSemaphoreCreateBinary();
 
 	/* create a timer task */
 	per_TimerHandle = xTimerCreate("Timer", pdMS_TO_TICKS(100), pdTRUE, NULL, TimerCallback);
 	xTimerStart(per_TimerHandle, 0);
 
+	/*Create alarm task*/
+	xTaskCreate(AlarmTask, "ALRM", configMINIMAL_STACK_SIZE, NULL, TASK_ALARM_PRI, NULL);
+
+	/*Create sensor data handler task*/
+	xTaskCreate(SensorDataHandler, "Sdh", configMINIMAL_STACK_SIZE, NULL, TASK_SDH_PRI, NULL);
+
+	/*Create 7 segment driver task*/
+	xTaskCreate(Seg7Task, "Se7", configMINIMAL_STACK_SIZE, NULL, TASK_SEG7_Task, NULL);
 	
 	/* SERIAL TRANSMITTER TASK */
 	xTaskCreate(SerialSend_Task, "STx", configMINIMAL_STACK_SIZE, NULL, TASK_SERIAL_SEND_PRI, NULL);
@@ -182,7 +186,6 @@ void main_demo( void )
 	r_point = 0;
 	xTaskCreate(PC_SerialReceive_Task, "PCRx", configMINIMAL_STACK_SIZE, NULL, TASK_PC_SERIAL_REC, NULL);
 
-
 	/* Create TBE semaphore - serial transmit comm */
 	TBE_BinarySemaphore = xSemaphoreCreateBinary();
 
@@ -191,12 +194,8 @@ void main_demo( void )
 	RXC_PCSemaphore = xSemaphoreCreateBinary();
 
 	/*Create State Semaphores*/
-	MonitorStateSem = xSemaphoreCreateBinary();
-	DriveStateSem = xSemaphoreCreateBinary();
-	SpeedStateSem = xSemaphoreCreateBinary();
-	OffStateSem = xSemaphoreCreateBinary();
 	AlarmStateSem = xSemaphoreCreateBinary(); 
-
+	
 	/* SERIAL TRANSMISSION INTERRUPT HANDLER */
 	vPortSetInterruptHandler(portINTERRUPT_SRL_TBE, prvProcessTBEInterrupt);
 
@@ -211,91 +210,117 @@ void main_demo( void )
 	while (1);
 }
 
-
-
-/*STATE MACHINE FOR THE SYSTEM*/
-/*This task determens the next state based on Msg input, and unblocks state tasks*/
-void SM_Task(void* pvParameters)
-{
-	uint8_t Msg;
-	while (1) {
-		xQueueReceive(MessageQueue, &Msg, portMAX_DELAY);/*Task is blocked until a new message arrives*/
-		takeAllStateSem();/*wait until a state task finishes and then block them so another state can be enabled*/
-		switch (Msg) 
-		{
-		case MONITOR:
-			xSemaphoreGive(MonitorStateSem, portMAX_DELAY);/*enable state task*/
-		case DRIVE:
-			xSemaphoreGive(DriveStateSem, portMAX_DELAY);/*enable state task*/
-		case SPEED:
-			xSemaphoreGive(SpeedStateSem, portMAX_DELAY);/*enable state task*/
-		case OFF:
-			xSemaphoreGive(OffStateSem, portMAX_DELAY);/*Turn off system*/
-		default:/*turn on alarm unexpected message is sent*/
-			xSemaphoreGive(AlarmStateSem, portMAX_DELAY);
-		}
-	}
-}
-
 /*This task checks if sensor values are within normal operating range,*/
-/*then sends sensor data to their state queues*/
+/*then sends sensor data to their state queues, determines led output state also*/
 void SensorDataHandler(void* pvParameters)
 {
-	/*Buffers for queues*/
-	sensor_val SensTemp;
-	monitor_val MonitorTemp;
-	drive_val DriveTemp;
-	speed_val SpeedTemp;
+	
+	sensor_val SensTemp; /*buffer for item from queue*/
+	uint8_t led = LED_OFF;/*Holds led value, initialised as turned off*/
+	uint8_t Msg = OFF;/*Hold state value, initialised as system turned off*/
 	while (1)
 	{	
-		xQueueReceive(SensorQueue,&SensTemp,portMAX_DELAY);/*recieve new sensor data*/
-		if(110u < SensTemp.coolant_temp)
-		{/*check if engine is overheating*/
-			xSemaphoreGive(AlarmStateSem, portMAX_DELAY);
+		xQueueReceive(SensorQueue, &SensTemp, portMAX_DELAY);/*recieve new sensor data*/
+		/*check if new mode command has arrived, if not use old mode*/
+		if (uxQueueMessagesWaiting(MessageQueue)) {
+			xQueueReceive(MessageQueue, &Msg, portMAX_DELAY);
 		}
-		else if (6000 < SensTemp.gas_pedal_pos)
-		{/*check if engine revs are too high*/
-			xSemaphoreGive(AlarmStateSem, portMAX_DELAY);
+		FormAndSend7SegData(SensTemp, Msg);/*format mode and sensor data for 7 segment display*/
+		
+		/*Check how should the led display work and send data to alarm task*/
+		if ((MONITOR == Msg)||(DRIVE == Msg)||(SPEED == Msg)) {/*if we are in working mode*/
+			if (MAX_COOLANT_TEMP < SensTemp.coolant_temp)
+			{/*check if engine is overheating, turn on alarm if needed*/
+				led = ALARM_ON;
+			}
+			else if (MAX_REVS < SensTemp.revs)
+			{/*check if engine revs are too high, turn on alarm if needed*/
+				led = ALARM_ON;
+			}
+			else/*all ok, turn on power on led*/
+			{
+				led = LED_ON;
+			}
 		}
-		else
-		{/*if sensor data is within range only then disable alarm*/
-			xSemaphoreTake(AlarmStateSem, portMAX_DELAY);
+		else/*if the system is turned off or a bad message is sent turn off display*/
+		{
+			led = LED_OFF;
 		}
-
-		/*Send monitor data to monitor queue*/
-		MonitorTemp.air_temp = SensTemp.air_temp;
-		MonitorTemp.coolant_temp = SensTemp.coolant_temp;
-		xQueueOverwrite(MonitorQueue, &MonitorTemp);
-		/*Send drive data to drive queue*/
-		DriveTemp.revs = SensTemp.revs;
-		DriveTemp.manifold_air_press = SensTemp.manifold_air_press;
-		xQueueOverwrite(DriveQueue, &DriveTemp);
-		/*Send speed data to drive queue*/
-		SpeedTemp.revs = SensTemp.revs;
-		SpeedTemp.gas_pedal_pos = SensTemp.gas_pedal_pos;
-		xQueueOverwrite(SpeedQueue, &SpeedTemp);
-
+		xQueueSend(LedQueue, &led, portMAX_DELAY);/*send data to alarm task*/
 	}
 }
 
 
-
+/*Save values gotten from led inputs (buttons), and send message for mode change*/
 void led_bar_tsk(void* pvParameters)
 {
 	unsigned i;
 	uint8_t d;
-			while (1)
+	uint8_t mode;
+	while (1)
 	{  
+		/*wait until a interrupt on led change gives a semaphore*/
+		/*read the value and send a corresponding message*/
 		xSemaphoreTake(LED_INT_BinarySemaphore, portMAX_DELAY);
-				get_LED_BAR(1, &d);
-		i = 3;
-		do
+		get_LED_BAR(0, &d);
+		switch (d) 
 		{
-			i--;
+		case BTN1:/*first button is monitor mode*/
+			mode = MONITOR;
+			break;
+		case BTN2:/*second button is drive mode*/
+			mode = DRIVE;
+			break;
+		case BTN3:/*third button is speed mode*/
+			mode = SPEED;
+			break;
+		case NO_BTN:/*when all buttons are released turn off system*/
+			mode = OFF;
+			break;
+		default:/*if random button combination is pressed turn off system and wait for new command*/
+			mode = OFF;
+			break;
+		}
+		xQueueSend(MessageQueue, &mode, portMAX_DELAY);
+	}
+}
+
+/*Write values to 7 segment display*/
+void Seg7Task(void* pvParameters) 
+{
+	uint8_t SegNum;
+	int i;
+	while (1)
+	{/*Send queue items to 7seg display*/
+		for (i = 0; i < 10; i++) {	
+			xQueueReceive(Seg7Queue, &SegNum, portMAX_DELAY);
 			select_7seg_digit(i);
-			set_7seg_digit(hexnum[d % 10]);
-			d /= 10;
-		} while (i > 0);
+			set_7seg_digit(hexnum[SegNum]);
+		}
+	}
+
+
+}
+
+/*This task implements LED display */
+void AlarmTask(void* pvParameters)
+{
+	uint8_t led = LED_OFF;
+	uint8_t temp_led;
+	while (1)
+	{	
+		xSemaphoreTake(AlarmStateSem, portMAX_DELAY);/*needs to be here for 200ms period of led blink*/
+		temp_led = led;/*remember old value for comparison*/
+		xQueueReceive(LedQueue, &led, portMAX_DELAY);/*load new value*/
+		if ((temp_led == led) && (ALARM_ON == led)) 
+		{/*if this is a even entry while alarm is on turn off all leds*/
+			led = LED_OFF;
+			set_LED_BAR(1, led);
+		}
+		else /*if its an odd entry while alarm is on turn on all leds, if not alarm is off do as requested*/
+		{
+			set_LED_BAR(1, led);
+		}
 	}
 }
 
@@ -307,9 +332,9 @@ void PC_SerialReceive_Task(void* pvParameters)
 	while (1)
 	{
 		xSemaphoreTake(RXC_PCSemaphore, portMAX_DELAY);/*suspend task until a character is received*/
-		get_serial_character(COM_CH, &cc);
+		get_serial_character(COM_CH_1, &cc);
 		if (0x0d == cc)
-		{
+		{/*Send message to sensor data handler to know which mode is on*/
 			xQueueSend(MessageQueue, &temp, portMAX_DELAY);
 		}
 		else
@@ -323,14 +348,13 @@ void PC_SerialReceive_Task(void* pvParameters)
 void SerialSend_Task(void* pvParameters)
 {
 	t_point = 0;
-	
 	while (1)
 	{
-		if (t_point > (sizeof(trigger) - 1))/*if we sent all trigger char reset trigger position*/
+		if (t_point > (sizeof(trigger) - 1))/*if we sent whole trigger word, reset trigger position*/
 		{
 			t_point = 0;
 		}
-		if (0u == t_point)/*if next on turn is first char of the trigger block task*/
+		if (0u == t_point)/*if next is first char of the trigger block task*/
 		{
 			xSemaphoreTake(TBE_BinarySemaphore, portMAX_DELAY);/*block task until 100ms have passed*/
 		}
@@ -344,18 +368,17 @@ void SerialSend_Task(void* pvParameters)
 void SerialReceive_Task(void* pvParameters)
 {
 	uint8_t cc = 0;
+	uint8_t Msg = OFF;
 	static uint8_t loca = 0;
 	sensor_val SensTemp;
 	while (1)
 	{
 		xSemaphoreTake(RXC_BinarySemaphore, portMAX_DELAY);/*suspend task until a character is received*/
 		get_serial_character(COM_CH, &cc);
-		printf("primio karakter: %u\n", (unsigned)cc);/*for debug*/
 		
 		if ((0x00 == cc)&&(R_BUF_SIZE == r_point)) /*initialise recieve buffer*/
 		{/*second check is if some sensor values are 0x00, so that we don't reinitialise the buffer */
-			r_point = 0;
-			
+			r_point = 0;			
 		}
 		else if ((cc == 0xff)&&(R_BUF_SIZE == r_point))/*end character case*/
 		{/*second check is if some sensor values are 0xff, so that we don't finish earlier*/
@@ -371,17 +394,73 @@ void SerialReceive_Task(void* pvParameters)
 		{
 			r_buffer[r_point++] = cc;
 		}
-		else/*comm error case, activate alarm*/
+		else/*comm error case turn off system*/
 		{
-			/*alarm task or smtng*/
+			xQueueSend(MessageQueue, &Msg, 0U);
 		}
 	}
 }
 
-/*Function used to take all semaphores*/
-void takeAllStateSem(void) {
-	xSemaphoreTake(MonitorStateSem, portMAX_DELAY);
-	xSemaphoreTake(DriveStateSem, portMAX_DELAY);
-	xSemaphoreTake(SpeedStateSem, portMAX_DELAY);
-	xSemaphoreTake(OffStateSem, portMAX_DELAY);
+/*This function formats data for displaying based on the current mode*/
+/*It is called every time new sensor data is available*/
+void FormAndSend7SegData(sensor_val SensTemp, uint8_t Msg)
+{
+	uint8_t Seg_data[10] = { 0 };
+	int i;
+	switch (Msg)
+	{
+	case MONITOR:/*add monitor values to Seg_data array*/
+		Seg_data[0] = 1;
+		for (i = 0; i <= 3; i++) {
+			Seg_data[9 - i] = SensTemp.coolant_temp % 10;
+			SensTemp.coolant_temp /= 10;
+		}
+		Seg_data[5] = 0;
+		for (i = 0; i <= 3; i++) {
+			Seg_data[4 - i] = SensTemp.air_temp % 10;
+			SensTemp.air_temp /= 10;
+		}
+		break;
+	case DRIVE:/*add drive values to Seg_data array*/
+		Seg_data[0] = 2;
+		if (9999u < SensTemp.revs)/*cant display a bigger value then 9999*/
+		{
+			SensTemp.revs = 9999u;
+		}
+		for (i = 0; i <= 3; i++) {
+			Seg_data[9 - i] = SensTemp.revs % 10;
+			SensTemp.revs /= 10;
+		}
+		Seg_data[5] = 0;
+		for (i = 0; i <= 3; i++) {
+			Seg_data[4 - i] = SensTemp.manifold_air_press % 10;
+			SensTemp.manifold_air_press /= 10;
+		}
+		break;
+	case SPEED:/*add speed values to Seg_data array*/
+		Seg_data[0] = 3;
+		if (9999u < SensTemp.revs)/*cant display a bigger value then 9999*/
+		{
+			SensTemp.revs = 9999u;
+		}
+		for (i = 0; i <= 3; i++) {
+			Seg_data[9 - i] = SensTemp.revs % 10;
+			SensTemp.revs /= 10;
+		}
+		Seg_data[5] = 0;
+		for (i = 0; i <= 3; i++) {
+			Seg_data[4 - i] = SensTemp.gas_pedal_pos % 10;
+			SensTemp.gas_pedal_pos /= 10;
+		}
+		break;
+	default:
+		/*last option to be sent is off state so we wont write anything to 7seg displey*/
+		/*if unknown value is sent system is off*/
+		break;
+	}
+	/*send array values to a queue to be displayed on 7 segment display*/
+	for (i = 0; i <= 9; i++)
+	{
+		xQueueSend(Seg7Queue, &Seg_data[i], portMAX_DELAY);
+	}
 }
