@@ -1,1 +1,1 @@
-start LED_bars_plus.exe gR
+start LED_bars_plus.exe bR
