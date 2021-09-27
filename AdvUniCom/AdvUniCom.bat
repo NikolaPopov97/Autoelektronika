@@ -1,2 +1,2 @@
-start AdvUniCom
-start AdvUniCom 1
+start AdvUniCom.exe
+start AdvUniCom.exe 1
