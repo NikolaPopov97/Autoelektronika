@@ -17,13 +17,14 @@
 #define COM_CH_1 (1)
 
 	/* TASK PRIORITIES */
-#define	SERVICE_TASK_PRI			( tskIDLE_PRIORITY + 2 )
 #define TASK_ALARM_PRI				( tskIDLE_PRIORITY + 1 )
-#define TASK_SDH_PRI				( tskIDLE_PRIORITY + 3 )
-#define TASK_SEG7_Task				( tskIDLE_PRIORITY + 4 )
-#define	TASK_SERIAL_SEND_PRI		( tskIDLE_PRIORITY + 5 )
-#define TASK_PC_SERIAL_REC			( tskIDLE_PRIORITY + 6 )
-#define TASK_SERIAl_REC_PRI			( tskIDLE_PRIORITY + 7 )
+#define	SERVICE_TASK_PRI			( tskIDLE_PRIORITY + 2 )
+#define TASK_PC_COMMAND				( tskIDLE_PRIORITY + 3 )
+#define TASK_SDH_PRI				( tskIDLE_PRIORITY + 4 )
+#define TASK_SEG7_Task				( tskIDLE_PRIORITY + 5 )
+#define	TASK_SERIAL_SEND_PRI		( tskIDLE_PRIORITY + 6 )
+#define TASK_PC_SERIAL_REC			( tskIDLE_PRIORITY + 7 )
+#define TASK_SERIAl_REC_PRI			( tskIDLE_PRIORITY + 8 )
 
 
 /* TASKS: FORWARD DECLARATIONS */
@@ -34,6 +35,7 @@ void PC_SerialReceive_Task(void* pvParameters);
 void SensorDataHandler(void* pvParameters);
 void Seg7Task(void* pvParameters);
 void AlarmTask(void* pvParameters);
+void PC_command(void* pvParameters);
 
 
 /* TRASNMISSION DATA - CONSTANT IN THIS APPLICATION */
@@ -62,9 +64,9 @@ static const char hexnum[] = { 0x3F, 0x06, 0x5B, 0x4F, 0x66, 0x6D, 0x7D, 0x07,
 #define LED_OFF  0x00
 
 /*BUTTON MASKS*/
-#define BTN1 0x80
-#define BTN2 0x40
-#define BTN3 0x20
+#define BTN1 0x04
+#define BTN2 0x02
+#define BTN3 0x01
 #define NO_BTN 0x00
 
 /*CRITICAL VALUES*/
@@ -81,6 +83,11 @@ typedef struct sensor_val{/*struct for holding sensor values*/
 	uint8_t gas_pedal_pos;
 }sensor_val;
 
+typedef struct commands {
+	uint8_t word[7];
+	uint8_t length;
+}commands;
+
 
 /* GLOBAL OS-HANDLES */
 SemaphoreHandle_t LED_INT_BinarySemaphore;
@@ -93,6 +100,7 @@ QueueHandle_t SensorQueue;
 QueueHandle_t MessageQueue;
 QueueHandle_t Seg7Queue;
 QueueHandle_t LedQueue;
+QueueHandle_t PCcommand;
 
 
 /*Local function declarations*/
@@ -157,6 +165,7 @@ void main_demo( void )
 	MessageQueue = xQueueCreate(5u, sizeof(uint8_t));
 	Seg7Queue = xQueueCreate(10u, sizeof(uint8_t));
 	LedQueue = xQueueCreate(1u, sizeof(uint8_t));
+	PCcommand = xQueueCreate(1u, sizeof(commands));
 
 
 	/* ON INPUT CHANGE INTERRUPT HANDLER */
@@ -185,6 +194,10 @@ void main_demo( void )
 	xTaskCreate(SerialReceive_Task, "SRx", configMINIMAL_STACK_SIZE, NULL, TASK_SERIAl_REC_PRI, NULL);
 	r_point = 0;
 	xTaskCreate(PC_SerialReceive_Task, "PCRx", configMINIMAL_STACK_SIZE, NULL, TASK_PC_SERIAL_REC, NULL);
+
+	/*Create a task that handles pc command*/
+	xTaskCreate(PC_command, "PCCx", configMINIMAL_STACK_SIZE, NULL, TASK_PC_COMMAND, NULL);
+
 
 	/* Create TBE semaphore - serial transmit comm */
 	TBE_BinarySemaphore = xSemaphoreCreateBinary();
@@ -225,8 +238,8 @@ void SensorDataHandler(void* pvParameters)
 		if (uxQueueMessagesWaiting(MessageQueue)) {
 			xQueueReceive(MessageQueue, &Msg, portMAX_DELAY);
 		}
-		FormAndSend7SegData(SensTemp, Msg);/*format mode and sensor data for 7 segment display*/
 		
+		FormAndSend7SegData(SensTemp, Msg);/*format mode and sensor data for 7 segment display*/
 		/*Check how should the led display work and send data to alarm task*/
 		if ((MONITOR == Msg)||(DRIVE == Msg)||(SPEED == Msg)) {/*if we are in working mode*/
 			if (MAX_COOLANT_TEMP < SensTemp.coolant_temp)
@@ -324,22 +337,67 @@ void AlarmTask(void* pvParameters)
 	}
 }
 
+void PC_command(void* pvParameters)
+{
+	uint8_t mode = OFF;
+	commands command;
+	while (1)
+	{
+		xQueueReceive(PCcommand, &command, portMAX_DELAY);
+		if (0u != command.length) {/*if there was no error handle commands*/
+			if (0u == strncmp(command.word, "MONITOR", command.length)) 
+			{
+				mode = MONITOR;
+			}
+			else if (0u == strncmp(command.word, "DRIVE", command.length))
+			{
+				mode = DRIVE;
+			}
+			else if (0u == strncmp(command.word, "SPEED", command.length))
+			{
+				mode = SPEED;
+			}
+			else 
+			{/*If anything elese is sent turn off system including OFF command*/
+				mode = OFF;
+			}
+			/*Send message to sensor data handler to know which mode is on*/
+			xQueueSend(MessageQueue, &mode, 0u);
+			printf("mode = %c \n", mode);
+		}
+		/*Dont inform messages was bad because it was done in PC_SerialReceive_Task*/
+	}
+}
+
 /*Task for receiving pc commands and sending them to another task to handle them*/
 void PC_SerialReceive_Task(void* pvParameters) 
 {
 	uint8_t cc;
-	uint8_t temp;
+	commands temp;
+	uint8_t pos = 0;
+	uint8_t Msg = OFF;
 	while (1)
 	{
 		xSemaphoreTake(RXC_PCSemaphore, portMAX_DELAY);/*suspend task until a character is received*/
 		get_serial_character(COM_CH_1, &cc);
-		if (0x0d == cc)
-		{/*Send message to sensor data handler to know which mode is on*/
-			xQueueSend(MessageQueue, &temp, portMAX_DELAY);
-		}
-		else
+		if (0x0d == cc)/*if CR received send data*/
 		{
-			temp = cc;
+			xQueueOverwrite(PCcommand, &temp);/*send command*/
+			pos = 0u;/*restart position for next command*/
+		}
+		else/*not the end of command, add character to buffer*/
+		{
+			if (6u >= pos) {/*if command contains more than 7 characters it is badly sent, handle in else*/
+				temp.word[pos] = cc;/*add character to array*/
+				temp.length = pos + 1u;/*save position*/
+				pos++;/*increment for next character*/
+			}
+			else
+			{/*max word size exceeded, turn off system probably error*/
+				xQueueSend(MessageQueue, &Msg, 0u);
+				temp.length = 0u;/*word size 0 so we know there was an error when CR is received*/
+			}
+			
 		}
 	}
 }
