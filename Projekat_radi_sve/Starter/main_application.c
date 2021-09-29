@@ -363,7 +363,7 @@ void PC_command(void* pvParameters)
 			}
 			/*Send message to sensor data handler to know which mode is on*/
 			xQueueSend(MessageQueue, &mode, 0u);
-			printf("mode = %c \n", mode);
+			//printf("mode = %c \n", mode);
 		}
 		/*Dont inform messages was bad because it was done in PC_SerialReceive_Task*/
 	}
